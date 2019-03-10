@@ -1,5 +1,5 @@
 # ansible-role-eks
-Ansible role for managing AWS EKS clusters (controlplane + nodes)
+Ansible role for managing AWS EKS clusters (controlplane + nodes) with option for **opt out** of **amazon-vpc-cni-k8s** :raised_hands:
 
 ## Requirements
 An AWS account and credentials with permissions to manipulate VPC, EC2, EKS, IAM.
