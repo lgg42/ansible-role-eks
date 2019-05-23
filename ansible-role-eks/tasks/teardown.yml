@@ -1,0 +1,110 @@
+- name: remove EKS cluster
+  aws_eks_cluster:
+    name: "{{ eks_cluster_name }}"
+    state: absent
+    region: "{{ eks_region }}"
+  register: eks_delete
+
+- name: find all ELBs
+  elb_classic_lb_facts:
+    region: "{{ eks_region }}"
+  register: elb_facts
+
+- name: remove cluster ELBs
+  ec2_elb_lb:
+    name: "{{ item.load_balancer_name }}"
+    region: "{{ eks_region }}"
+    wait: yes
+    state: absent
+  loop: "{{ elb_facts.elbs }}"
+  when: "('kubernetes.io/cluster/' + eks_cluster_name) in item.tags"
+
+- name: remove ASG
+  ec2_asg:
+    name: "eks-{{ eks_cluster_name }}-{{ item.name }}-nodes"
+    region: "{{ eks_region }}"
+    state: absent
+  loop: "{{ nodes_pool }}"
+
+- name: get Launch Configurations
+  ec2_lc_facts:
+  register: lc_results
+
+- name: remove clusters's Launch Configurations
+  ec2_lc:
+    name: "{{ item.launch_configuration_name }}"
+    region: "{{ eks_region }}"
+    state: absent
+  loop: "{{ lc_results.launch_configurations }}"
+  when: item.launch_configuration_name is match("eks-{{ eks_cluster_name }}.*")
+
+- name: wait 5 min for the EKS cluster to be removed before tearing down the VPC
+  pause:
+    minutes: 5
+  when: eks_delete is changed
+
+- name: get VPC id
+  ec2_vpc_net_facts:
+    filters:
+      tag:Name: "{{ eks_vpc_name }}"
+    region: "{{ eks_region }}"
+  register: eks_vpc_facts
+
+- name: remove route table
+  ec2_vpc_route_table:
+    vpc_id: '{{ eks_vpc_facts.vpcs[0].vpc_id }}'
+    region: "{{ eks_region }}"
+    tags:
+      Name: Public
+    state: absent
+
+- name: remove igw
+  ec2_vpc_igw:
+    vpc_id: '{{ eks_vpc_facts.vpcs[0].vpc_id }}'
+    region: "{{ eks_region }}"
+    state: absent
+
+- name: find all security groups in the VPC
+  ec2_group_facts:
+    filters:
+      vpc-id: '{{ eks_vpc_facts.vpcs[0].vpc_id }}'
+    region: "{{ eks_region }}"
+  register: ec2_groups
+
+- name: set all security group rule lists to empty to remove circular dependency
+  ec2_group:
+    name: "{{ item.group_name }}"
+    description: "{{ item.description }}"
+    state: present
+    rules: []
+    rules_egress: []
+    purge_rules: yes
+    purge_rules_egress: yes
+    vpc_id: '{{ eks_vpc_facts.vpcs[0].vpc_id }}'
+    region: "{{ eks_region }}"
+  loop: "{{ ec2_groups.security_groups }}"
+
+- name: remove security groups
+  ec2_group:
+    name: '{{ item.group_name }}'
+    state: absent
+    vpc_id: '{{ eks_vpc_facts.vpcs[0].vpc_id }}'
+    region: "{{ eks_region }}"
+  loop: "{{ ec2_groups.security_groups }}"
+  when: "item.group_name != 'default'"
+
+- name: remove setup subnet
+  ec2_vpc_subnet:
+    az: '{{ eks_region }}{{ item.zone }}'
+    vpc_id: '{{ eks_vpc_facts.vpcs[0].vpc_id }}'
+    cidr: "{{ item.cidr}}"
+    state: absent
+    region: "{{ eks_region }}"
+  loop: "{{ eks_subnets }}"
+
+- name: remove setup VPC
+  ec2_vpc_net:
+    cidr_block: "{{ eks_vpc_cidr }}"
+    state: absent
+    name: "{{ eks_vpc_name }}"
+    region: "{{ eks_region }}"

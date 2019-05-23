@@ -1,0 +1,17 @@
+# Control Plane
+
+eks_cluster_name: k8s
+eks_key_name: "aws"
+eks_key_file: "aws"
+eks_region: us-west-1
+eks_vpc_cidr: 10.0.0.0/16
+eks_vpc_name: eks-vpc
+
+eks_kubeconfig: ~/.kube/{{ eks_cluster_name }}.config
+eks_cluster_role_name: eksClusterRole
+eks_kubeconfig_env: []
+eks_action: setup
+
+eks_lifecycle_hook_name: "{{ eks_cluster_name }}-nodes-lifecycle-hook"
+eks_worker_role_name: eksWorkerRole
+eks_bootstrap_arguments: ""

@@ -1,0 +1,11 @@
+---
+- hosts: localhost
+  gather_facts: false
+  vars:
+    REGION: eu-west-1
+    aws_access_key: "{{ AWS_ACCESS_KEY }}"
+    aws_secret_key: "{{ AWS_SECRET_KEY }}"
+  roles:
+    - role: ansible-role-eks
+      tags:
+        - nodes

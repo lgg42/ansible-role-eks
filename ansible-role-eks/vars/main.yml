@@ -1,0 +1,126 @@
+#----------------- general -----------------#
+setup_vpc: true
+install_cni_genie: false
+install_weave: true
+eks_version: "1.11"
+
+
+#-------------- control plane --------------#
+
+eks_cluster_name: prod
+eks_key_name: "aws"
+eks_key_file: "aws"
+eks_region: eu-west-1
+eks_vpc_cidr: 10.0.0.0/16
+eks_vpc_name: eks-vpc
+
+eks_kubeconfig_dir: ~/.kube/
+eks_kubeconfig: "{{ eks_cluster_name }}.config"
+eks_cluster_role_name: eksClusterRole
+eks_kubeconfig_env: []
+eks_action: setup
+
+eks_subnets:
+  - cidr: 10.0.10.0/24
+    zone: a
+  - cidr: 10.0.11.0/24
+    zone: b
+  - cidr: 10.0.12.0/24
+    zone: c
+
+eks_security_groups:
+  - name: "{{ eks_cluster_name }}-control-plane-sg"
+    description: "EKS Control Plane Security Group"
+    rules:
+      - group_name: "{{ eks_cluster_name }}-workers-sg"
+        rule_desc: "Allow pods to communicate with the cluster API server"
+        group_desc: "EKS Worker Security Group"
+        ports: 443
+        proto: tcp
+    rules_egress:
+      - group_name: "{{ eks_cluster_name }}-workers-sg"
+        rule_desc: "Allow the cluster control plane to communicate with the worker Kubelet and pods"
+        group_desc: "EKS Worker Security Group"
+        from_port: 1025
+        to_port: 65535
+        proto: tcp
+      - group_name: "{{ eks_cluster_name }}-workers-sg"
+        rule_desc: "Allow the cluster control plane to communicate with pods running extension API servers on port 443"
+        group_desc: "EKS Worker Security Group"
+        ports: 443
+        proto: tcp
+  - name: "{{ eks_cluster_name }}-workers-sg"
+    description: "EKS Worker Security Group"
+    rules:
+      - group_name: "{{ eks_cluster_name }}-workers-sg"
+        rule_desc: "Allow worker nodes to communicate with each other"
+        proto: all
+        from_port: 1
+        to_port: 65535
+      - group_name: "{{ eks_cluster_name }}-control-plane-sg"
+        rule_desc: "Allow worker Kubelets and pods to receive communication from the cluster control plane"
+        from_port: 1025
+        to_port: 65535
+        proto: tcp
+      - group_name: "{{ eks_cluster_name }}-control-plane-sg"
+        rule_desc: "Allow pods running extension API servers on port 443 to receive communication from cluster control plane"
+        ports: 443
+        proto: tcp
+      - ports: 22
+        rule_desc: "Allow SSH to nodes"
+        proto: tcp
+        cidr_ip: 0.0.0.0/0
+      - from_port: 1
+        to_port: 65535
+        cidr_ip:
+          - "{{ eks_subnets[0].cidr }}"
+          - "{{ eks_subnets[1].cidr }}"
+          - "{{ eks_subnets[2].cidr }}"
+    tags:
+      KubernetesCluster: "{{ eks_cluster_name }}"
+
+#-------------- worker nodes -------------#
+
+nodes_pool:
+
+  - name: main
+    state: present
+    # LC
+    eks_lc_ami_id: ami-098fb7e9b507904e7
+    eks_lc_assign_public_ip: yes
+    eks_lc_instance_profile_name: "{{ eks_worker_role_name }}"
+    eks_lc_instance_type: t3.small
+    eks_lc_key_name: aws
+    eks_lc_security_groups: "{{ eks_cluster_name }}-workers-sg"
+    eks_lc_user_data: "{{ lookup('template', 'user_data.j2') }}"
+    eks_lc_region: "{{ eks_region }}"
+    # ASG
+    eks_asg_min_size: 1
+    eks_asg_max_size: 10
+    eks_asg_desired_capacity: 2
+    eks_asg_lifecycle_hook_name: "{{ eks_cluster_name }}-nodes-lifecycle-hook"
+    eks_asg_tags:
+      - Enviroment: production
+    eks_worker_role_name: eksWorkerRole
+    eks_bootstrap_arguments: ""
+
+  - name: infra
+    state: present
+    # LC
+    eks_lc_ami_id: ami-098fb7e9b507904e7
+    eks_lc_assign_public_ip: yes
+    eks_lc_instance_profile_name: "{{ eks_worker_role_name }}"
+    eks_lc_instance_type: t3.small
+    eks_lc_key_name: aws
+    eks_lc_security_groups: "{{ eks_cluster_name }}-workers-sg"
+    eks_lc_user_data: "{{ lookup('template', 'user_data.j2') }}"
+    eks_lc_region: "{{ eks_region }}"
+    # ASG
+    eks_asg_min_size: 1
+    eks_asg_max_size: 2
+    eks_asg_desired_capacity: 2
+    eks_asg_lifecycle_hook_name: "{{ eks_cluster_name }}-nodes-lifecycle-hook"
+    eks_asg_tags:
+      - Enviroment: infra
+    eks_worker_role_name: eksWorkerRole
+    eks_bootstrap_arguments: "--node-labels=role=infra"

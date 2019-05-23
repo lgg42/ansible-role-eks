@@ -1,0 +1,256 @@
+
+#---------------- control plane ---------------#
+
+- name: checks | ensure AWS keypair exists
+  ec2_key:
+    name: "{{ eks_key_name }}"
+    key_material: "{{ lookup('file', '../../keys/' + eks_key_file + '.pub') }}"
+    region: "{{ eks_region }}"
+  tags: 
+    - controlplane
+
+- name: checks | ensure kubeconfig path exists
+  file:
+    path: "{{ eks_kubeconfig_dir }}"
+    state: directory
+  tags: controlplane
+
+  #- name: checks | ensure OpenShift Python client is installed
+  #  pip:
+  #    name: openshift
+  #  tags: 
+  #    - controlplane
+
+- name: IAM | ensure EKS service role exists
+  iam_role:
+    name: "{{ eks_cluster_role_name }}"
+    managed_policies:
+      - AmazonEKSClusterPolicy
+      - AmazonEKSServicePolicy
+    assume_role_policy_document: "{{ lookup('file', 'eks-trust-policy.json') }}"
+    description: "Allows EKS to manage clusters on your behalf."
+  register: eks_cluster_iam_role
+  tags: controlplane
+
+- name: IAM | create managed policy for additional EKS Worker permissions
+  iam_managed_policy:
+    policy_name: "EKSWorkerAdditionalPolicy"
+    policy: "{{ lookup('file', 'eks-worker-additional-policy.json') }}"
+  tags: controlplane
+
+- name: IAM | ensure IAM worker node role exists
+  iam_role:
+    name: "{{ eks_worker_role_name }}"
+    managed_policies:
+      - AmazonEKSWorkerNodePolicy
+      - AmazonEKS_CNI_Policy
+      - AmazonEC2ContainerRegistryReadOnly
+      - EKSWorkerAdditionalPolicy
+    assume_role_policy_document: "{{ lookup('file', 'ec2-trust-policy.json') }}"
+  register: eks_worker_iam_role
+  tags: controlplane
+
+- name: VPC | ensure VPC exists
+  ec2_vpc_net:
+    name: "{{ eks_vpc_name }}"
+    cidr_block: "{{ eks_vpc_cidr }}"
+    region: "{{ eks_region }}"
+  register: eks_vpc_results
+  tags: controlplane
+
+- name: VPC | ensure subnets exist
+  ec2_vpc_subnet:
+    vpc_id: "{{ eks_vpc_results.vpc.id }}"
+    az: "{{ eks_region }}{{ item.zone }}"
+    cidr: "{{ item.cidr }}"
+    tags:
+      Name: "eks-{{ eks_cluster_name }}-subnet-{{ item.zone }}"
+      KubernetesCluster: "{{ eks_cluster_name }}"
+    purge_tags: no
+    region: "{{ eks_region }}"
+  register: eks_subnet_results
+  loop: "{{ eks_subnets }}"
+  tags: controlplane
+
+- name: VPC | ensure igw exists
+  ec2_vpc_igw:
+    vpc_id: "{{ eks_vpc_results.vpc.id }}"
+    region: "{{ eks_region }}"
+    state: present
+  register: eks_vpc_igw
+  when: setup_vpc
+
+- name: VPC | create public route table
+  ec2_vpc_route_table:
+    vpc_id: "{{ eks_vpc_results.vpc.id }}"
+    region: "{{ eks_region }}"
+    tags:
+      Name: Public
+    subnets: "{{ eks_subnet_results.results | json_query('[].subnet.id') }}"
+    routes:
+      - dest: 0.0.0.0/0
+        gateway_id: "{{ eks_vpc_igw.gateway_id }}"
+  when: setup_vpc
+
+- name: VPC | ensure security groups exist
+  ec2_group:
+    name: "{{ item.name }}"
+    description: "{{ item.description }}"
+    state: present
+    rules: "{{ item.rules }}"
+    rules_egress: "{{ item.rules_egress|default(omit) }}"
+    vpc_id: '{{ eks_vpc_results.vpc.id }}'
+    region: "{{ eks_region }}"
+    tags: "{{ item.tags | default({}) }}"
+    purge_tags: no
+    purge_rules: no
+    purge_rules_egress: no
+  with_items: "{{ eks_security_groups }}"
+  register: eks_security_group_results
+  tags: controlplane
+
+- name: EKS | ensure EKS cluster exists
+  aws_eks_cluster:
+    name: "{{ eks_cluster_name }}"
+    #security_groups: "{{ eks_security_groups | json_query('[].name') }}"
+    security_groups: "{{ eks_cluster_name }}-control-plane-sg"
+    subnets: "{{ eks_subnet_results.results | json_query('[].subnet.id') }}"
+    role_arn: "{{ eks_cluster_iam_role.arn }}"
+    version: "{{ eks_version }}"
+    region: "{{ eks_region }}"
+    wait: yes
+  register: eks_create
+  tags: controlplane
+
+- name: config | output kube config
+  template:
+    src: kube.config.j2
+    dest: "{{ eks_kubeconfig_dir }}{{ eks_kubeconfig }}"
+  tags: controlplane
+
+- name: config | add authentication configuration
+  k8s:
+    definition: "{{ lookup('template', role_path + '/templates/aws-auth-cm.yml') }}"
+    kubeconfig: "{{ eks_kubeconfig_dir }}{{ eks_kubeconfig }}"
+  tags: controlplane
+
+- name: CNI | remove aws-node
+  k8s:
+    kubeconfig: "{{ eks_kubeconfig_dir }}{{ eks_kubeconfig }}"
+    state: absent
+    api_version: v1
+    kind: DaemonSet
+    namespace: kube-system
+    name: aws-node
+  when: install_cni_genie or install_weave
+  tags: controlplane
+
+- name: CNI | install CNI-Genie
+  k8s:
+    definition: "{{ lookup('file', role_path + '/files/genie-plugin.yaml') }}"
+    kubeconfig: "{{ eks_kubeconfig_dir }}{{ eks_kubeconfig }}"
+  when: install_cni_genie
+  tags: controlplane
+  
+- name: CNI | install Weave
+  shell: |
+    kubectl --kubeconfig ~/.kube/prod.config apply -f https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')
+
+  # WIP  
+  #k8s:
+  #  definition: "{{ lookup('file', role_path + '/files/{{ item }}.yaml') }}"
+  #  kubeconfig: "{{ eks_kubeconfig_dir }}{{ eks_kubeconfig }}"
+  #  force: true
+  #loop: "{{ cni_plugins }}"
+  when: install_weave
+  tags: controlplane
+  
+#---------------- node pools ---------------#
+
+- name: checks | ensure AWS keypair exists
+  ec2_key:
+    name: "{{ item.eks_lc_key_name }}"
+    key_material: "{{ lookup('file', '../../keys/' + item.eks_lc_key_name + '.pub') }}"
+    region: "{{ eks_region }}"
+  loop: "{{ nodes_pool }}"
+  tags: nodes
+
+
+- name: LC | ensure launch configuration exists
+  vars:
+    eks_lc_hash: "{{ (item.eks_lc_ami_id ~ item.eks_lc_assign_public_ip ~ item.eks_lc_instance_profile_name ~ item.eks_lc_instance_type ~ item.eks_lc_key_name ~ item.eks_lc_security_groups ~ item.eks_lc_user_data ~ item.eks_bootstrap_arguments) | hash('md5') | truncate(10,False,'') }}"
+  ec2_lc:
+    name: "eks-{{ eks_cluster_name }}-{{ item.name }}-lc-{{ eks_lc_hash }}"
+    state: present
+    instance_profile_name: "{{ item.eks_lc_instance_profile_name }}"
+    image_id: "{{ item.eks_lc_ami_id }}"
+    assign_public_ip: "{{ item.eks_lc_assign_public_ip }}"
+    instance_type: "{{ item.eks_lc_instance_type }}"
+    key_name: "{{ item.eks_lc_key_name }}"
+    security_groups: "{{ item.eks_lc_security_groups }}"
+    user_data: "{{ lookup('template', 'user_data.j2', template_vars=dict(eks_bootstrap_arguments=item.eks_bootstrap_arguments)) }}"
+    region: "{{ eks_region }}"
+  loop: "{{ nodes_pool }}"
+  when: item.state == "present"
+  tags: nodes
+
+- name: ASG | ensure autoscaling group exists
+  vars:
+    eks_lc_hash: "{{ (item.eks_lc_ami_id ~ item.eks_lc_assign_public_ip ~ item.eks_lc_instance_profile_name ~ item.eks_lc_instance_type ~ item.eks_lc_key_name ~ item.eks_lc_security_groups ~ item.eks_lc_user_data ~ item.eks_bootstrap_arguments) | hash('md5') | truncate(10,False,'') }}"
+  ec2_asg:
+    name: "eks-{{ eks_cluster_name }}-{{ item.name }}-nodes"
+    state: "{{ item.state }}"
+    vpc_zone_identifier: "{{ eks_subnet_results.results | json_query('[].subnet.id') }}"
+    desired_capacity: "{{ item.eks_asg_desired_capacity }}"
+    min_size: "{{ item.eks_asg_min_size }}"
+    max_size: "{{ item.eks_asg_max_size }}"
+    launch_config_name: "eks-{{ eks_cluster_name }}-{{ item.name }}-lc-{{ eks_lc_hash }}"
+    region: "{{ eks_region }}"
+    replace_all_instances: yes
+    tags: "{{ item.eks_asg_tags|default([]) + [{'Name': 'eks-' + eks_cluster_name + '-' + item.name + '-node','kubernetes.io/cluster/' + eks_cluster_name: 'owned', 'propagate_at_launch': 'true'}] }}"
+  loop: "{{ nodes_pool }}"
+  when: item.state == "present"
+  tags: nodes
+
+- name: ASG | ensure autoscaling group is removed
+  ec2_asg:
+    name: "eks-{{ eks_cluster_name }}-{{ item.name }}-nodes"
+    region: "{{ eks_region }}"
+    state: absent
+  loop: "{{ nodes_pool }}"
+  when: item.state == "absent"
+  tags: nodes
+
+- name: LC | ensure launch configuration is removed
+  block:
+    - ec2_lc_facts:
+      register: lc_results
+
+    - ec2_lc:
+        name: "{{ item[1].launch_configuration_name }}"
+        region: "{{ eks_region }}"
+        state: absent
+      with_nested: 
+        - "{{ nodes_pool }}"
+        - "{{ lc_results.launch_configurations }}"
+      when:
+        - item[0].state == "absent"
+        - item[1].launch_configuration_name is search("eks-{{ eks_cluster_name }}-{{ item[0].name }}-lc")
+  tags: nodes
+
+# WIP
+#- name: ensure lifecycle hook exists
+#  ec2_asg_lifecycle_hook:
+#    state: present
+#    autoscaling_group_name: "{{ eks_asg_name }}"
+#    lifecycle_hook_name: "{{ eks_lifecycle_hook_name }}"
+#    transition: autoscaling:EC2_INSTANCE_LAUNCHING
+#    heartbeat_timeout: 3600
+#    default_result: ABANDON
+#    region: "{{ eks_region }}"
+#  register: eks_lifecycle_hook
+
+- name: Info
+  debug:
+    msg: >
+      {{ eks_cluster_name }} kubernetes cluster setup complete. export KUBECONFIG={{ eks_kubeconfig_dir }}{{ eks_kubeconfig }} to use kubectl with this cluster

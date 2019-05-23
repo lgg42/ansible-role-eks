@@ -1,0 +1,8 @@
+#!/bin/bash
+set -o xtrace
+
+/etc/eks/bootstrap.sh {{ eks_cluster_name }} \
+{% if install_cni_genie or install_weave %}
+	--use-max-pods false \
+{% endif %}
+        --kubelet-extra-args '{{ eks_bootstrap_arguments }}'
